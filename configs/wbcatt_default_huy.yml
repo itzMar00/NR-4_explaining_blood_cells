@@ -1,0 +1,9 @@
+config_name: wbcatt_integrate_on_huy_laptop
+experiment_name: wbcatt_default
+
+
+data:
+  dataset_name: wbcatt
+  wbcatt_working_dir: wbcatt/
+  wbcatt_images_dir: wbcatt/submission/data/PBC/PBC_dataset_normal_DIB
+  image_filename_extension: jpg

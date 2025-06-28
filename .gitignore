@@ -1,0 +1,31 @@
+# ===== SOME DEFAULT GITIGNORE ENTRIES =====
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+.ipynb_checkpoints/
+
+.DS_Store
+.vscode/
+*.code-workspace
+# ===== end ====
+
+# ===== our custom entries: =====
+# ignore wbcatt folder (I have wbcatt folder inside my repo root)
+wbcatt
+
+# ignore any files/folders starts with 'temp'
+temp*
+
+*.log
+*.out
+*.err
+# *.pkl # Uncomment if you want to ignore pickle files
+# *.pth # Uncomment if you want to ignore PyTorch model files

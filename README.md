@@ -1,3 +1,7 @@
+## NR#4 Explaining blood cells classification/attributes in style
+> work in progress... readme for our lab project
+
+---
 ## Alias-Free Generative Adversarial Networks (StyleGAN3)<br><sub>Official PyTorch implementation of the NeurIPS 2021 paper</sub>
 
 ![Teaser image](./docs/stylegan3-teaser-1920x1006.png)

@@ -16,7 +16,7 @@ import json
 import tempfile
 import torch
 import sys
-
+from typing import Any, Optional
 import dnnlib
 import wandb
 from training import training_loop
@@ -24,9 +24,49 @@ from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 
+
+### -------------------------------------------------------------------------
+
+def initialize_wandb_config(opts: dnnlib.EasyDict) -> dict[str, Any]:
+    """
+    Retrieve wandb config from environment variables (Set this in your .sh files)
+    Docs: https://docs.wandb.ai/ref/python/init/
+    Do some if-else processing as well
+
+    Example: in `script.sh`
+            export WANDB_PROJECT="mw823-albert-ludwigs-universit-t-freiburg"
+            export WANDB_NAME="run-$(date +%Y%m%d-%H%M%S)"
+            export WANDB_TAGS="customtagIwant,wbc,${SLURM_JOB_ID}"
+            export WANDB_MODE="online"
+    """
+
+    config: dict = {
+        'entity': os.environ.get('WANDB_ENTITY', "mw823-albert-ludwigs-universit-t-freiburg"),
+        'project': os.environ.get('WANDB_PROJECT', "mw823-albert-ludwigs-universit-t-freiburg"),
+        'name': os.environ.get('WANDB_NAME', None),  # Set the experiment name
+        'tags': os.environ.get('WANDB_TAGS', '').split(',') if os.environ.get('WANDB_TAGS') else [],
+        'mode': os.environ.get('WANDB_MODE', 'online'),  # 'online', 'offline'
+        'resume': os.environ.get('WANDB_RESUME', 'allow'), # Not sure if this really helps...
+    }
+
+    if opts is not None:
+        config['tags'].append(opts.cfg)
+        if opts.cond:
+            config['tags'].append('conditional')
+        else:
+            config['tags'].append('unconditional')
+
+    return config
+
+
+
 #----------------------------------------------------------------------------
 
-def subprocess_fn(rank, c, temp_dir):
+def subprocess_fn(rank, c, temp_dir, opts: dnnlib.EasyDict):
+    """
+    Args (new added):
+        opts (dnnlib.EasyDict): Carry passed arguments to train.py
+    """
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Init torch.distributed.
@@ -49,19 +89,30 @@ def subprocess_fn(rank, c, temp_dir):
         if not hasattr(sys.stderr, "isatty"):
             sys.stderr = sys.__stderr__
 
-        wandb.init(
-            project="mw823-albert-ludwigs-universit-t-freiburg",           
-            name=os.path.basename(c.run_dir),      # run name = output directory
+        wandb_config: dict = initialize_wandb_config(opts=opts)
+        # run name = StyleGan-named output dir if not specified in ENVS
+        wandb_name: str = wandb_config['name'] or os.path.basename(c.run_dir)
+
+        wandb_instance: wandb.Run = wandb.init(
+            entity=wandb_config['entity'],
+            project=wandb_config['project'],
+            name=wandb_name,
             config=c,                              # logs all training config
             dir=c.run_dir,                         # store wandb logs inside run_dir
-            resume="allow"                         # allows resuming
+            resume=wandb_config['resume'],
+            tags=wandb_config['tags']
         )
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    training_loop.training_loop(rank=rank, wandb=wandb_instance, **c)
 
 #----------------------------------------------------------------------------
 
-def launch_training(c, desc, outdir, dry_run):
+def launch_training(c, desc, outdir, dry_run, opts: dnnlib.EasyDict):
+    """
+
+    added Args:
+        opts (dnnlib.EasyDict): Carry passed arguments to train.py call
+    """
     dnnlib.util.Logger(should_flush=True)
 
     # Pick output directory.
@@ -106,9 +157,9 @@ def launch_training(c, desc, outdir, dry_run):
     torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
-            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
+            subprocess_fn(rank=0, c=c, temp_dir=temp_dir, opts=opts)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
+            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir, opts), nprocs=c.num_gpus)
 
 #----------------------------------------------------------------------------
 
@@ -202,8 +253,8 @@ def main(**kwargs):
     c = dnnlib.EasyDict() # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0,0.99], eps=1e-8)
+    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0,0.99], eps=1e-8)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
@@ -291,7 +342,7 @@ def main(**kwargs):
         desc += f'-{opts.desc}'
 
     # Launch.
-    launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
+    launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run, opts=opts)
 
 #----------------------------------------------------------------------------
 

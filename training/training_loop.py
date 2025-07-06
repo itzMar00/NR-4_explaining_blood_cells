@@ -13,6 +13,7 @@ import time
 import copy
 import json
 import pickle
+from typing import Optional
 import psutil
 import PIL.Image
 import numpy as np
@@ -120,6 +121,7 @@ def training_loop(
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
+    wandb                   = None,     # Wandb instance from train.py for logging
 ):
     # Initialize.
     start_time = time.time()
@@ -227,25 +229,8 @@ def training_loop(
     # Initialize logs.
     if rank == 0:
         print('Initializing logs...')
-        try:
-            import wandb
-            wandb.init(
-                project='stylegan3',
-                name=os.path.basename(run_dir),
-                dir=run_dir,
-                config=dict(
-                    total_kimg=total_kimg,
-                    batch_size=batch_size,
-                    G_reg_interval=G_reg_interval,
-                    D_reg_interval=D_reg_interval,
-                    G_opt_kwargs=G_opt_kwargs,
-                    D_opt_kwargs=D_opt_kwargs,
-                    **loss_kwargs,
-                )
-            )
-        except ImportError:
-            wandb = None
-            print("wandb not available, skipping wandb logging.")
+        if wandb is None:
+            print("wandb not initialized or passed by train.py, skipping wandb logging")
 
     stats_collector = training_stats.Collector(regex='.*')
     stats_metrics = dict()
@@ -386,6 +371,7 @@ def training_loop(
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
+        last_snapshot_path: Optional[str] = getattr(training_loop, '_last_snapshot_path', None)
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
@@ -399,8 +385,18 @@ def training_loop(
                 del value # conserve memory
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
+                # Delete previous snapshot
+                if last_snapshot_path is not None and os.path.exists(last_snapshot_path) and not done:
+                    try:
+                        os.remove(last_snapshot_path)
+                        print(f"Removed previous snapshot at {last_snapshot_path}")
+                    except OSError as e:
+                        print(f"Error removing previous snapshot: {e}")
+
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
+
+                training_loop._last_snapshot_path = snapshot_pkl
 
         # Evaluate metrics.
         if (snapshot_data is not None) and (len(metrics) > 0):

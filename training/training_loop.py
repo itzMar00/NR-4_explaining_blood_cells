@@ -227,6 +227,26 @@ def training_loop(
     # Initialize logs.
     if rank == 0:
         print('Initializing logs...')
+        try:
+            import wandb
+            wandb.init(
+                project='stylegan3',
+                name=os.path.basename(run_dir),
+                dir=run_dir,
+                config=dict(
+                    total_kimg=total_kimg,
+                    batch_size=batch_size,
+                    G_reg_interval=G_reg_interval,
+                    D_reg_interval=D_reg_interval,
+                    G_opt_kwargs=G_opt_kwargs,
+                    D_opt_kwargs=D_opt_kwargs,
+                    **loss_kwargs,
+                )
+            )
+        except ImportError:
+            wandb = None
+            print("wandb not available, skipping wandb logging.")
+
     stats_collector = training_stats.Collector(regex='.*')
     stats_metrics = dict()
     stats_jsonl = None
@@ -352,6 +372,16 @@ def training_loop(
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+        if wandb is not None:
+            import torchvision
+            image_tensor = torch.tensor(images, dtype=torch.float32)  # shape: (N, C, H, W) or (N, H, W, C)
+            if image_tensor.ndim == 4 and image_tensor.shape[1] in [1, 3]:  # already CHW
+                image_tensor = image_tensor
+            else:
+                image_tensor = image_tensor.permute(0, 3, 1, 2)  # convert NHWC to NCHW
+            image_tensor = (image_tensor + 1) / 2  # map from [-1,1] to [0,1]
+            image_grid = torchvision.utils.make_grid(image_tensor, nrow=grid_size[0], normalize=True)
+            wandb.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
 
         # Save network snapshot.
         snapshot_pkl = None
@@ -396,18 +426,24 @@ def training_loop(
 
         # Update logs.
         timestamp = time.time()
+        global_step = int(cur_nimg / 1e3)
         if stats_jsonl is not None:
             fields = dict(stats_dict, timestamp=timestamp)
             stats_jsonl.write(json.dumps(fields) + '\n')
             stats_jsonl.flush()
         if stats_tfevents is not None:
-            global_step = int(cur_nimg / 1e3)
+            # global_step = int(cur_nimg / 1e3)
             walltime = timestamp - start_time
             for name, value in stats_dict.items():
                 stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
             for name, value in stats_metrics.items():
                 stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
             stats_tfevents.flush()
+        if wandb is not None:
+            for name, value in stats_dict.items():
+                wandb.log({name: value.mean}, step=global_step)
+            for name, value in stats_metrics.items():
+                wandb.log({f"Metrics/{name}": value}, step=global_step)
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)
 
@@ -423,5 +459,9 @@ def training_loop(
     if rank == 0:
         print()
         print('Exiting...')
+
+    if wandb is not None:
+        wandb.finish()
+
 
 #----------------------------------------------------------------------------

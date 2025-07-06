@@ -15,8 +15,10 @@ import re
 import json
 import tempfile
 import torch
+import sys
 
 import dnnlib
+import wandb
 from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
@@ -43,6 +45,17 @@ def subprocess_fn(rank, c, temp_dir):
     if rank != 0:
         custom_ops.verbosity = 'none'
 
+    if rank == 0:
+        if not hasattr(sys.stderr, "isatty"):
+            sys.stderr = sys.__stderr__
+
+        wandb.init(
+            project="mw823-albert-ludwigs-universit-t-freiburg",           
+            name=os.path.basename(c.run_dir),      # run name = output directory
+            config=c,                              # logs all training config
+            dir=c.run_dir,                         # store wandb logs inside run_dir
+            resume="allow"                         # allows resuming
+        )
     # Execute training loop.
     training_loop.training_loop(rank=rank, **c)
 

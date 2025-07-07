@@ -19,11 +19,13 @@
 #SBATCH --output run_logs/%x-%A.out
 #SBATCH --error run_logs/%x-%A.err
 
-#SBATCH --mem=8G
+#SBATCH --mem=12G
 #SBATCH --gres=gpu:1
-#SBATCH --time=1:00:00
-
-
+#SBATCH --time=2:00:00
+source /etc/cuda_env
+cuda12.6
+which nvcc
+nvcc --version
 
 PROJECT_DIR=$PWD  # Project dir where train.py is
 RESULT_DIR=$PROJECT_DIR/training-runs/stylegan3-r/results # specify output results dir for stylegan's train.py to generate
@@ -55,6 +57,9 @@ export WANDB_MODE="online"
 # Activate env
 source ~/miniconda3/bin/activate
 conda activate /work/dlclarge2/tranh-nr4/environment
+
+which nvcc
+nvidia-smi
 
 python $PROJECT_DIR/NR-4_explaining_blood_cells/train.py  \
     --outdir=$RESULT_DIR \

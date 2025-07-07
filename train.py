@@ -103,7 +103,7 @@ def subprocess_fn(rank, c, temp_dir, opts: dnnlib.EasyDict):
             tags=wandb_config['tags']
         )
     # Execute training loop.
-    training_loop.training_loop(rank=rank, wandb=wandb_instance, **c)
+    training_loop.training_loop(rank=rank, wandb_instance=wandb_instance, **c)
 
 #----------------------------------------------------------------------------
 

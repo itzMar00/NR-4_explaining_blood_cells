@@ -17,6 +17,7 @@ from typing import Optional
 import psutil
 import PIL.Image
 import numpy as np
+import wandb
 import torch
 import dnnlib
 from torch_utils import misc
@@ -121,7 +122,7 @@ def training_loop(
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
-    wandb                   = None,     # Wandb instance from train.py for logging
+    wandb_instance                   = None,     # Wandb instance from train.py for logging
 ):
     # Initialize.
     start_time = time.time()
@@ -229,7 +230,7 @@ def training_loop(
     # Initialize logs.
     if rank == 0:
         print('Initializing logs...')
-        if wandb is None:
+        if wandb_instance is None:
             print("wandb not initialized or passed by train.py, skipping wandb logging")
 
     stats_collector = training_stats.Collector(regex='.*')
@@ -357,7 +358,7 @@ def training_loop(
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-        if wandb is not None:
+        if wandb_instance is not None:
             import torchvision
             image_tensor = torch.tensor(images, dtype=torch.float32)  # shape: (N, C, H, W) or (N, H, W, C)
             if image_tensor.ndim == 4 and image_tensor.shape[1] in [1, 3]:  # already CHW
@@ -366,7 +367,7 @@ def training_loop(
                 image_tensor = image_tensor.permute(0, 3, 1, 2)  # convert NHWC to NCHW
             image_tensor = (image_tensor + 1) / 2  # map from [-1,1] to [0,1]
             image_grid = torchvision.utils.make_grid(image_tensor, nrow=grid_size[0], normalize=True)
-            wandb.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
+            wandb_instance.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
 
         # Save network snapshot.
         snapshot_pkl = None
@@ -435,11 +436,11 @@ def training_loop(
             for name, value in stats_metrics.items():
                 stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
             stats_tfevents.flush()
-        if wandb is not None:
+        if wandb_instance is not None:
             for name, value in stats_dict.items():
-                wandb.log({name: value.mean}, step=global_step)
+                wandb_instance.log({name: value.mean}, step=global_step)
             for name, value in stats_metrics.items():
-                wandb.log({f"Metrics/{name}": value}, step=global_step)
+                wandb_instance.log({f"Metrics/{name}": value}, step=global_step)
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)
 
@@ -456,8 +457,8 @@ def training_loop(
         print()
         print('Exiting...')
 
-    if wandb is not None:
-        wandb.finish()
+    if wandb_instance is not None:
+        wandb_instance.finish()
 
 
 #----------------------------------------------------------------------------

@@ -358,16 +358,16 @@ def training_loop(
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-        if wandb_instance is not None:
-            import torchvision
-            image_tensor = torch.tensor(images, dtype=torch.float32)  # shape: (N, C, H, W) or (N, H, W, C)
-            if image_tensor.ndim == 4 and image_tensor.shape[1] in [1, 3]:  # already CHW
-                image_tensor = image_tensor
-            else:
-                image_tensor = image_tensor.permute(0, 3, 1, 2)  # convert NHWC to NCHW
-            image_tensor = (image_tensor + 1) / 2  # map from [-1,1] to [0,1]
-            image_grid = torchvision.utils.make_grid(image_tensor, nrow=grid_size[0], normalize=True)
-            wandb_instance.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
+            if wandb_instance is not None:
+                import torchvision
+                image_tensor = torch.tensor(images, dtype=torch.float32)  # shape: (N, C, H, W) or (N, H, W, C)
+                if image_tensor.ndim == 4 and image_tensor.shape[1] in [1, 3]:  # already CHW
+                    image_tensor = image_tensor
+                else:
+                    image_tensor = image_tensor.permute(0, 3, 1, 2)  # convert NHWC to NCHW
+                image_tensor = (image_tensor + 1) / 2  # map from [-1,1] to [0,1]
+                image_grid = torchvision.utils.make_grid(image_tensor, nrow=grid_size[0], normalize=True)
+                wandb_instance.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
 
         # Save network snapshot.
         snapshot_pkl = None

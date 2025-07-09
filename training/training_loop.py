@@ -370,9 +370,13 @@ def training_loop(
                 wandb_instance.log({f"Fakes/{cur_nimg//1000:06d}kimg": wandb.Image(image_grid)}, step=cur_nimg//1000)
 
         # Save network snapshot.
+        # --------- INITIALIZE VARIABLES FOR KEEPING TRACK of SNAPSHOTS ---------
         snapshot_pkl = None
         snapshot_data = None
         last_snapshot_path: Optional[str] = getattr(training_loop, '_last_snapshot_path', None)
+        best_metric_value: Optional[float] = getattr(training_loop, '_best_metric_value', None)
+        best_snapshot_path: Optional[str] = getattr(training_loop, '_best_snapshot_path', None)
+        # -----------------------------------------------------------------------
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
@@ -386,8 +390,13 @@ def training_loop(
                 del value # conserve memory
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
-                # Delete previous snapshot
-                if last_snapshot_path is not None and os.path.exists(last_snapshot_path) and not done:
+                # Delete previous snapshot (but if it's the best one, keep it)
+                if (
+                    last_snapshot_path is not None
+                    and os.path.exists(last_snapshot_path)
+                    and not done
+                    and (last_snapshot_path != best_snapshot_path)
+                ):
                     try:
                         os.remove(last_snapshot_path)
                         print(f"Removed previous snapshot at {last_snapshot_path}")
@@ -403,12 +412,55 @@ def training_loop(
         if (snapshot_data is not None) and (len(metrics) > 0):
             if rank == 0:
                 print('Evaluating metrics...')
+
+            # Metric to compare between checkpoints is the first one in the list
+            main_metric = metrics[0]
+
             for metric in metrics:
                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
                     dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
+
+                # ------- update model snapshot if it is better than the previous one -------
+                if metric == main_metric and rank == 0:
+                    metric_name = list(result_dict.results.keys())[0]
+                    metric_value = result_dict.results[metric_name]
+
+                    # Check if current evaluated metric is better
+                    is_better = False
+                    if best_metric_value is None:
+                        is_better = True
+                    elif 'fid' in metric_name.lower():
+                        is_better = metric_value < best_metric_value
+                    else:  # For most other metrics like precision/recall, IS, etc., higher is better
+                        is_better = metric > best_metric_value
+
+                    # If better and we have a snapshot, save it
+                    if is_better and snapshot_data is not None:
+                        # Update function tracker attributes:
+                        training_loop._best_snapshot_path = snapshot_pkl
+                        training_loop._best_metric_value = metric_value
+
+                        # Log in output what's the best one is
+                        print(f"New best metric {metric_name} = {metric_value:.4f}, Path: {snapshot_pkl}")
+
+                        # Sync and log to wandb
+                        if wandb_instance is not None:
+                            wandb_instance.log({
+                                f'New Best {metric_name}': metric_name,
+                                'Best Value': metric_value,
+                                'Snapshot step': cur_nimg // 1000,
+                            }, step=cur_nimg // 1000)
+
+                            try:
+                                model_artifact = wandb.Artifact(f"best_model_{metric_name}", type="model")
+                                model_artifact.add_file(snapshot_pkl, name=os.path.basename(snapshot_pkl))
+                                wandb_instance.log_artifact(model_artifact)
+                            except Exception as e:
+                                print(f"Error logging new best model artifact to wandb: {e}")
+
         del snapshot_data # conserve memory
 
         # Collect statistics.

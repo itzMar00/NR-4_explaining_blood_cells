@@ -85,6 +85,11 @@ def subprocess_fn(rank, c, temp_dir, opts: dnnlib.EasyDict):
     if rank != 0:
         custom_ops.verbosity = 'none'
 
+    # Initialize wandb_instance to None for all processes.
+    # to avoid issues with wandb.init() being called multiple times.
+    # only the rank 0 process will actually initialize wandb.
+    wandb_instance: Optional[wandb.Run] = None
+
     if rank == 0:
         if not hasattr(sys.stderr, "isatty"):
             sys.stderr = sys.__stderr__

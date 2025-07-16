@@ -27,6 +27,8 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+import os
+import random
 
 #----------------------------------------------------------------------------
 
@@ -157,12 +159,44 @@ def training_loop(
     G_ema = copy.deepcopy(G).eval()
 
     # Resume from existing pickle.
+    # old tensorflow code
+    # if (resume_pkl is not None) and (rank == 0):
+    #     print(f'Resuming from "{resume_pkl}"')
+    #     with dnnlib.util.open_url(resume_pkl) as f:
+    #         resume_data = legacy.load_network_pkl(f)
+    #     for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+    #         misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+
+    # new pytorch implementation
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
-            resume_data = legacy.load_network_pkl(f)
-        for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
-            misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+            resume_data = torch.load(f, weights_only=False)
+        # Restore model weights
+        G.load_state_dict(resume_data['G'])
+        D.load_state_dict(resume_data['D'])
+        G_ema.load_state_dict(resume_data['G_ema'])
+        # Restore optimizer and scheduler if available (optional)
+        # for phase in phases:
+        #     if phase.name in resume_data['optimizer']:
+        #         phase.opt.load_state_dict(resume_data['optimizer'][phase.name])
+        # if 'lr_scheduler' in resume_data and lr_scheduler is not None:
+        #     lr_scheduler.load_state_dict(resume_data['lr_scheduler'])
+        # Restore RNG states
+        random.setstate(resume_data['random_state'])
+        np.random.set_state(resume_data['numpy_random_state'])
+        torch.set_rng_state(resume_data['torch_random_state'])
+        torch.cuda.set_rng_state_all(resume_data['cuda_random_state'])
+        # Restore counters
+        cur_tick = resume_data['tick']
+        cur_nimg = resume_data['img_count']
+        # Restore augmentation pipeline (if any)
+        # if resume_data['augment_pipe'] is not None and augment_pipe is not None:
+        #     augment_pipe.load_state_dict(resume_data['augment_pipe'])
+        if 'glr' in resume_data:
+            G_opt_kwargs.lr = resume_data['glr']
+        if 'dlr' in resume_data:
+            D_opt_kwargs.lr = resume_data['dlr']
 
     # Print network summary tables.
     if rank == 0:
@@ -181,6 +215,10 @@ def training_loop(
         augment_pipe.p.copy_(torch.as_tensor(augment_p))
         if ada_target is not None:
             ada_stats = training_stats.Collector(regex='Loss/signs/real')
+
+    # Restore augment_pipe state if resuming
+    if resume_data is not None and 'augment_pipe' in resume_data and augment_pipe is not None:
+        augment_pipe.load_state_dict(resume_data['augment_pipe'])
 
     # Distribute across GPUs.
     if rank == 0:
@@ -213,6 +251,12 @@ def training_loop(
         if rank == 0:
             phase.start_event = torch.cuda.Event(enable_timing=True)
             phase.end_event = torch.cuda.Event(enable_timing=True)
+
+    # Resume optimizer states
+    if resume_data is not None:
+        for phase in phases:
+            if phase.name in resume_data['optimizer']:
+                phase.opt.load_state_dict(resume_data['optimizer'][phase.name])
 
     # Export sample images.
     grid_size = None
@@ -378,17 +422,40 @@ def training_loop(
         best_snapshot_path: Optional[str] = getattr(training_loop, '_best_snapshot_path', None)
         # -----------------------------------------------------------------------
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
-            for key, value in snapshot_data.items():
-                if isinstance(value, torch.nn.Module):
-                    value = copy.deepcopy(value).eval().requires_grad_(False)
-                    if num_gpus > 1:
-                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
-                        for param in misc.params_and_buffers(value):
-                            torch.distributed.broadcast(param, src=0)
-                    snapshot_data[key] = value.cpu()
-                del value # conserve memory
-            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+            # old legacy code
+            # snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
+            # for key, value in snapshot_data.items():
+            #     if isinstance(value, torch.nn.Module):
+            #         value = copy.deepcopy(value).eval().requires_grad_(False)
+            #         if num_gpus > 1:
+            #             misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
+            #             for param in misc.params_and_buffers(value):
+            #                 torch.distributed.broadcast(param, src=0)
+            #         snapshot_data[key] = value.cpu()
+            #     del value # conserve memory
+            # snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+
+            # new code using pytorch
+            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg // 1000:06d}.pkl')
+            if rank == 0:
+                snapshot_data = {
+                    'G': G.state_dict(),
+                    'D': D.state_dict(),
+                    'G_ema': G_ema.state_dict(),
+                    'augment_pipe': augment_pipe.state_dict() if augment_pipe is not None else None,
+                    'training_set_kwargs': dict(training_set_kwargs),
+                    'tick': cur_tick,
+                    'img_count': cur_nimg,
+                    'random_state': random.getstate(),
+                    'numpy_random_state': np.random.get_state(),
+                    'torch_random_state': torch.get_rng_state(),
+                    'cuda_random_state': torch.cuda.get_rng_state_all(),
+                    'optimizer': {phase.name: phase.opt.state_dict() for phase in phases},
+                    'glr': G_opt_kwargs.lr,
+                    'dlr': D_opt_kwargs.lr,
+                    # 'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
+                }
+
             if rank == 0:
                 # Delete previous snapshot (but if it's the best one, keep it)
                 if (
@@ -403,9 +470,9 @@ def training_loop(
                     except OSError as e:
                         print(f"Error removing previous snapshot: {e}")
 
-                with open(snapshot_pkl, 'wb') as f:
-                    pickle.dump(snapshot_data, f)
-
+                # with open(snapshot_pkl, 'wb') as f:
+                #     pickle.dump(snapshot_data, f)
+                torch.save(snapshot_data, snapshot_pkl)
                 training_loop._last_snapshot_path = snapshot_pkl
 
         # Evaluate metrics.
@@ -413,11 +480,18 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...')
 
+            # creating models from state_dicts
+            # Rebuild the G_ema model from its state_dict for metric calculation
+            common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
+            G_ema_for_metric = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device)
+            G_ema_for_metric.load_state_dict(snapshot_data['G_ema'])
+            G_ema_for_metric.eval()
+
             # Metric to compare between checkpoints is the first one in the list
             main_metric = metrics[0]
 
             for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+                result_dict = metric_main.calc_metric(metric=metric, G=G_ema_for_metric,
                     dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)

@@ -954,8 +954,8 @@ def main(**kwargs):
     c = dnnlib.EasyDict() # Main config dict.
     c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
-    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0,0.99], eps=1e-8)
-    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.0,0.99], eps=1e-8)
+    c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.5,0.9], eps=1e-8)
+    c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0.5,0.9], eps=1e-8) # Match Noah's [reproduce] findings
     # StylEx loss now:
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StylExLoss')
     c.loss_kwargs.lambda_l1 = opts.lambda_l1
@@ -993,7 +993,7 @@ def main(**kwargs):
 
     # ---------- E args ----------
     c.E_kwargs = dnnlib.EasyDict(class_name='train_stylex.Encoder')
-    c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.elr, betas=[0.0,0.99], eps=1e-8)
+    c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.elr, betas=[0.5,0.9], eps=1e-8) # Based on Noah's [reproduce] findings
     c.classifier_path = opts.classifier_path
     c.num_classes = opts.num_classes
     c.lambda_l1 = opts.lambda_l1
@@ -1055,12 +1055,9 @@ def main(**kwargs):
 
 
     # Setup run dir
-    desc = f'stylex-wbc-{opts.cfg}-gamma{opts.gamma}-gpus{c.num_gpus:d}-batch{c.batch_size:d}'
+    desc = f'stylex-gamma{opts.gamma}-gpus{c.num_gpus:d}-b{c.batch_size:d}-glr{c.G_opt_kwargs.lr:.6f}-dlr{c.D_opt_kwargs.lr:.6f}-elr{c.E_opt_kwargs.lr:.6f}-aug{opts.aug}-'
 
     # Launch training
-    # For simplicity, this single-file version only supports single-GPU training.
-    # The original multiprocessing launch is more complex.
-    assert c.num_gpus == 1, "This simplified script only supports single-GPU training."
     stylex_launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run, opts=opts)
 
 

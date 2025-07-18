@@ -57,7 +57,9 @@ export WANDB_MODE="online"
 python $PROJECT_DIR/NR-4_explaining_blood_cells/train_stylex.py  \
     --outdir=$RESULT_DIR \
     --data=$DATA_PATH \
-    --cfg=stylegan2 --gpus=1 --batch=16 --gamma=0.8192 --map-depth=2 --glr=0.0025 --dlr=0.0025 --cbase=16384 \
+    --cfg=stylegan2 --gpus=1 --batch=16 --gamma=0.8192 --map-depth=2 --cbase=16384 \
+    --lambda-l1=0.1 --lambda-lpips=0.1 --lambda-w-rec=1.0 --lambda-cls=1.0 \
+    --elr=0.00001 --glr=0.0002 --dlr=0.0002 \
     --cond=True --aug=ada --snap 20 --classifier-path=$CLASSIFIER_PATH
 
 echo "=== JOB FINISHED ==="

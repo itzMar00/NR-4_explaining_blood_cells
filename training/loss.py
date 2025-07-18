@@ -262,7 +262,7 @@ class StylExLoss(StyleGAN2Loss):
             if loss_Gpl is not None:
                 final_G_E_loss += loss_Gpl
 
-            if final_G_E_loss != 0:
+            if torch.is_tensor(final_G_E_loss):
                 with torch.autograd.profiler.record_function('G_E_main_backward'):
                     final_G_E_loss.mean().mul(gain).backward()
 

@@ -2,9 +2,10 @@ import copy
 import json
 import os
 import re
+import sys
 import tempfile
 import time
-from random import random
+import random
 from typing import List, Optional
 
 import click
@@ -27,6 +28,7 @@ import legacy
 from metrics import metric_main
 from torch_utils import misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
+from torch_utils import custom_ops
 
 
 def setup(seed):
@@ -423,19 +425,19 @@ def stylex_training_loop(
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, **loss_kwargs)
     # TODO: Incorporate E and C into the training from here down...?
     phases = []
-    ge_params = list(G.parameters()) + list(E.parameters())
     GE_opt_kwargs = G_opt_kwargs.copy()
     for name, module_list, opt_kwargs, reg_interval in [('G', [G, E], GE_opt_kwargs, G_reg_interval),
                                                    ('D', [D], D_opt_kwargs, D_reg_interval)]:
+        all_params = [p for m in module_list for p in m.parameters()]
         if reg_interval is None:
-            opt = dnnlib.util.construct_class_by_name(params=[p for m in module_list for p in m.parameters()], **opt_kwargs) # subclass of torch.optim.Optimizer
+            opt = dnnlib.util.construct_class_by_name(params=all_params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module_list, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-            opt = dnnlib.util.construct_class_by_name(params=[p for m in module_list for p in m.parameters()], **opt_kwargs) # subclass of torch.optim.Optimizer
+            opt = dnnlib.util.construct_class_by_name(params=all_params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module_list, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module_list, opt=opt, interval=reg_interval)]
     for phase in phases:
@@ -524,12 +526,11 @@ def stylex_training_loop(
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             for module in phase.module:
-                module.requires_grad_(True)
-
+                module.requires_grad_(False)
             # Update weights.
             # --------- NOTE: This handles gradient reduction for multi-GPU training. IGNORED for now -----------
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                params = [param for param in phase.module.parameters() if param.grad is not None]
+                params = [p for m in phase.module for p in m.parameters() if p.grad is not None]
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
                     if num_gpus > 1:
@@ -716,7 +717,7 @@ def stylex_training_loop(
                             }, step=cur_nimg // 1000)
 
                             try:
-                                model_artifact = wandb.Artifact(f"best_model_{metric_name}", type="model")
+                                model_artifact = wandb.Artifact(f"stylex_{os.path.basename(snapshot_pkl)}", type="model")
                                 model_artifact.add_file(snapshot_pkl, name=os.path.basename(snapshot_pkl))
                                 wandb_instance.log_artifact(model_artifact)
                             except Exception as e:
@@ -780,7 +781,50 @@ def stylex_training_loop(
 # ======================================================================================
 # === ARGS & SETUPS (from train.py)
 # ======================================================================================
+def stylex_subprocess_fn(rank, c, temp_dir, opts: dnnlib.EasyDict):
+    dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
+    # Init torch.distributed.
+    if c.num_gpus > 1:
+        init_file = os.path.abspath(os.path.join(temp_dir, '.torch_distributed_init'))
+        if os.name == 'nt':
+            init_method = 'file:///' + init_file.replace('\\', '/')
+            torch.distributed.init_process_group(backend='gloo', init_method=init_method, rank=rank, world_size=c.num_gpus)
+        else:
+            init_method = f'file://{init_file}'
+            torch.distributed.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=c.num_gpus)
+
+    # Init torch_utils.
+    sync_device = torch.device('cuda', rank) if c.num_gpus > 1 else None
+    training_stats.init_multiprocessing(rank=rank, sync_device=sync_device)
+    if rank != 0:
+        custom_ops.verbosity = 'none'
+
+    # Initialize wandb_instance to None for all processes.
+    # to avoid issues with wandb.init() being called multiple times.
+    # only the rank 0 process will actually initialize wandb.
+    wandb_instance: Optional[wandb.Run] = None
+
+    if rank == 0:
+        if not hasattr(sys.stderr, "isatty"):
+            sys.stderr = sys.__stderr__
+
+        wandb_instance: Optional[wandb.Run] = None
+        from train import initialize_wandb_config
+        wandb_config: dict = initialize_wandb_config(opts=opts)
+        wandb_name: str = wandb_config['name'] or os.path.basename(c.run_dir)
+
+        wandb_instance: wandb.Run = wandb.init(
+            entity=wandb_config['entity'],
+            project=wandb_config['project'],
+            name=wandb_name,
+            config=c,                              # logs all training config
+            dir=c.run_dir,                         # store wandb logs inside run_dir
+            resume=wandb_config['resume'],
+            tags=wandb_config['tags']
+        )
+    # Execute training loop.
+    stylex_training_loop(rank=rank, wandb_instance=wandb_instance, **c)
 def stylex_launch_training(c, desc, outdir, dry_run, opts: dnnlib.EasyDict):
     """
     Mixed subprocess_fn and launch_training from train.py
@@ -826,12 +870,14 @@ def stylex_launch_training(c, desc, outdir, dry_run, opts: dnnlib.EasyDict):
     with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
         json.dump(c, f, indent=2)
 
-    # TODO: DO multi gpu
-    dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
-    # TODO: Wandb
-    wandb_instance = None
-    rank=0
-    stylex_training_loop(rank=rank, wandb_instance=wandb_instance, **c)
+    # Launch processes.
+    print('Launching processes...')
+    torch.multiprocessing.set_start_method('spawn')
+    with tempfile.TemporaryDirectory() as temp_dir:
+        if c.num_gpus == 1:
+            stylex_subprocess_fn(rank=0, c=c, temp_dir=temp_dir, opts=opts)
+        else:
+            torch.multiprocessing.spawn(fn=stylex_subprocess_fn, args=(c, temp_dir, opts), nprocs=c.num_gpus)
 
 def init_dataset_kwargs(data):
     try:
@@ -942,7 +988,9 @@ def main(**kwargs):
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True)
     c.data_loader_kwargs.num_workers = opts.workers
+
     # ---------- E args ----------
     c.E_kwargs = dnnlib.EasyDict(class_name='train_stylex.Encoder')
     c.E_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.elr, betas=[0.0,0.99], eps=1e-8)

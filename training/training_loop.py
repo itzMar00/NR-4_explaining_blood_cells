@@ -168,6 +168,7 @@ def training_loop(
     #         misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
     # new pytorch implementation
+    resume_data = None
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
@@ -529,7 +530,7 @@ def training_loop(
                             }, step=cur_nimg // 1000)
 
                             try:
-                                model_artifact = wandb.Artifact(f"best_model_{metric_name}", type="model")
+                                model_artifact = wandb.Artifact(f"best_model_{os.path.basename(snapshot_pkl)}", type="model")
                                 model_artifact.add_file(snapshot_pkl, name=os.path.basename(snapshot_pkl))
                                 wandb_instance.log_artifact(model_artifact)
                             except Exception as e:

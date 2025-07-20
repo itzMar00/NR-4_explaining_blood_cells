@@ -251,7 +251,7 @@ class Encoder(nn.Module):
         x = self.backbone.b4.conv(x)
         x = self.backbone.b4.fc(x.flatten(1))
         # Project the features to W+ space using our custom layer
-        w_plus = self.final_layer(x)
+        w_plus = self.final_layer(x.to(torch.float32))
 
         # Reshape to the standard [batch_size, num_ws, w_dim] format
         return w_plus.view(-1, self.num_ws, self.w_dim)
@@ -433,10 +433,10 @@ def stylex_training_loop(
             opt = dnnlib.util.construct_class_by_name(params=all_params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module_list, opt=opt, interval=1)]
         else: # Lazy regularization.
-            mb_ratio = reg_interval / (reg_interval + 1)
+            # mb_ratio = reg_interval / (reg_interval + 1)
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
-            opt_kwargs.lr = opt_kwargs.lr * mb_ratio
-            opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
+            # opt_kwargs.lr = opt_kwargs.lr * mb_ratio
+            # opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             opt = dnnlib.util.construct_class_by_name(params=all_params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module_list, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module_list, opt=opt, interval=reg_interval)]
@@ -524,7 +524,7 @@ def stylex_training_loop(
             for module in phase.module:
                 module.requires_grad_(True)
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg, batch_idx=batch_idx)
             for module in phase.module:
                 module.requires_grad_(False)
             # Update weights.
@@ -620,8 +620,10 @@ def stylex_training_loop(
         last_snapshot_path: Optional[str] = getattr(stylex_training_loop, '_last_snapshot_path', None)
         best_metric_value: Optional[float] = getattr(stylex_training_loop, '_best_metric_value', None)
         best_snapshot_path: Optional[str] = getattr(stylex_training_loop, '_best_snapshot_path', None)
+        # Consistent if statement across all ranks (gpus)
+        should_save_snapshot = (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0)
         # -----------------------------------------------------------------------
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+        if should_save_snapshot:
             # old legacy code
             # snapshot_data = dict(G=G, D=D, G_ema=G_ema, augment_pipe=augment_pipe, training_set_kwargs=dict(training_set_kwargs))
             # for key, value in snapshot_data.items():
@@ -656,30 +658,24 @@ def stylex_training_loop(
                     'dlr': D_opt_kwargs.lr,
                     # 'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
                 }
-
-            if rank == 0:
-                # REMOVED: "Delete previous snapshot (but if it's the best one, keep it)"
-                #  Just save the current snapshot for this code
                 torch.save(snapshot_data, snapshot_pkl)
                 stylex_training_loop._last_snapshot_path = snapshot_pkl
+                del snapshot_data  # conserve memory
 
-        # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0):
+        # Wait for rank = 0 to finish saving the snapshot.
+        if num_gpus > 1:
+            torch.distributed.barrier()
+
+        # Evaluate metrics: synchronize decision that all ranks should skip metrics or evaluate metrics:
+        if should_save_snapshot and (len(metrics) > 0):
             if rank == 0:
                 print('Evaluating metrics...')
-
-            # creating models from state_dicts
-            # Rebuild the G_ema model from its state_dict for metric calculation
-            common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
-            G_ema_for_metric = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device)
-            G_ema_for_metric.load_state_dict(snapshot_data['G_ema'])
-            G_ema_for_metric.eval()
 
             # Metric to compare between checkpoints is the first one in the list
             main_metric = metrics[0]
 
             for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=G_ema_for_metric,
+                result_dict = metric_main.calc_metric(metric=metric, G=G_ema,
                     dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
@@ -700,7 +696,7 @@ def stylex_training_loop(
                         is_better = metric > best_metric_value
 
                     # If better and we have a snapshot, save it
-                    if is_better and snapshot_data is not None:
+                    if is_better:
                         # Update function tracker attributes:
                         stylex_training_loop._best_snapshot_path = snapshot_pkl
                         stylex_training_loop._best_metric_value = metric_value
@@ -717,13 +713,14 @@ def stylex_training_loop(
                             }, step=cur_nimg // 1000)
 
                             try:
-                                model_artifact = wandb.Artifact(f"stylex_{os.path.basename(snapshot_pkl)}", type="model")
-                                model_artifact.add_file(snapshot_pkl, name=os.path.basename(snapshot_pkl))
+                                model_artifact = wandb.Artifact(f"stylex_{os.path.basename(os.path.dirname(snapshot_pkl))}", type="model")
+                                model_artifact.add_file(snapshot_pkl, name=os.path.basename(os.path.dirname(snapshot_pkl)))
                                 wandb_instance.log_artifact(model_artifact)
                             except Exception as e:
                                 print(f"Error logging new best model artifact to wandb: {e}")
-
-        del snapshot_data # conserve memory
+        # Again, wait for all ranks to finish evaluating metrics
+        if num_gpus > 1:
+            torch.distributed.barrier()
 
         # Collect statistics.
         for phase in phases:

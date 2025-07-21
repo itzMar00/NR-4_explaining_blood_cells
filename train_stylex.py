@@ -366,6 +366,18 @@ def stylex_training_loop(
     E = dnnlib.util.construct_class_by_name(**E_kwargs,w_dim=G.w_dim, num_ws=G.num_ws, **common_kwargs, **D_backbone_kwargs).train().to(device)
     # C = load_wbc_attribute_classifier(classifier_path, device)
     C = load_resnet18_classifier(path=classifier_path, num_classes=5, device=device)
+    cur_nimg = resume_kimg * 1000
+    cur_tick = 0
+    # Setup augmentation.
+    if rank == 0:
+        print('Setting up augmentation...')
+    augment_pipe = None
+    ada_stats = None
+    if (augment_kwargs is not None) and (augment_p > 0 or ada_target is not None):
+        augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+        augment_pipe.p.copy_(torch.as_tensor(augment_p))
+        if ada_target is not None:
+            ada_stats = training_stats.Collector(regex='Loss/signs/real')
 
     # new pytorch implementation for resuming the model
     resume_data = None
@@ -390,6 +402,12 @@ def stylex_training_loop(
             G_opt_kwargs.lr = resume_data['glr']
         if 'dlr' in resume_data:
             D_opt_kwargs.lr = resume_data['dlr']
+        if 'elr' in resume_data:
+            E_opt_kwargs.lr = resume_data['elr']
+        if 'augment_pipe' in resume_data and augment_pipe is not None:
+            augment_pipe.load_state_dict(resume_data['augment_pipe'])
+        cur_tick = resume_data['tick']
+        cur_nimg = resume_data['img_count']
 
     # Print network summary tables: TODO:
     if rank == 0:
@@ -400,16 +418,7 @@ def stylex_training_loop(
         misc.print_module_summary(D, [img, c])
         misc.print_module_summary(E, [img, c])
 
-    # Setup augmentation.
-    if rank == 0:
-        print('Setting up augmentation...')
-    augment_pipe = None
-    ada_stats = None
-    if (augment_kwargs is not None) and (augment_p > 0 or ada_target is not None):
-        augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-        augment_pipe.p.copy_(torch.as_tensor(augment_p))
-        if ada_target is not None:
-            ada_stats = training_stats.Collector(regex='Loss/signs/real')
+
 
     # --- Setup Optimizers and Losses ---
     if rank == 0: print('Setting up optimizers and losses...')
@@ -488,8 +497,7 @@ def stylex_training_loop(
     if rank == 0:
         print(f'Training for {total_kimg} kimg...')
         print()
-    cur_nimg = resume_kimg * 1000
-    cur_tick = 0
+
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time

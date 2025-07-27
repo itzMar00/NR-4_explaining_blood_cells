@@ -1,11 +1,11 @@
 import copy
 import json
 import os
+import random
 import re
 import sys
 import tempfile
 import time
-import random
 from typing import List, Optional
 
 import click
@@ -26,9 +26,8 @@ from tqdm.auto import tqdm
 import dnnlib
 import legacy
 from metrics import metric_main
-from torch_utils import misc, training_stats
+from torch_utils import custom_ops, misc, training_stats
 from torch_utils.ops import conv2d_gradfix, grid_sample_gradfix
-from torch_utils import custom_ops
 
 
 def setup(seed):
@@ -381,8 +380,9 @@ def stylex_training_loop(
 
     # new pytorch implementation for resuming the model
     resume_data = None
-    if (resume_pkl is not None) and (rank == 0):
-        print(f'Resuming from "{resume_pkl}"')
+    if (resume_pkl is not None):
+        if rank == 0:
+            print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = torch.load(f, weights_only=False)
         # Restore model weights
@@ -458,6 +458,7 @@ def stylex_training_loop(
 
     # Resume optimizer states
     if resume_data is not None:
+        if rank == 0: print("Resuming optimizer states...")
         for phase in phases:
             if phase.name in resume_data['optimizer']:
                 phase.opt.load_state_dict(resume_data['optimizer'][phase.name])

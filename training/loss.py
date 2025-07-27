@@ -8,11 +8,14 @@
 
 """Loss functions."""
 
+import lpips
 import numpy as np
 import torch
+import torch.nn.functional as F
+import torchvision
+
 from torch_utils import training_stats
-from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import upfirdn2d
+from torch_utils.ops import conv2d_gradfix, upfirdn2d
 
 #----------------------------------------------------------------------------
 
@@ -138,3 +141,124 @@ class StyleGAN2Loss(Loss):
                 (loss_Dreal + loss_Dr1).mean().mul(gain).backward()
 
 #----------------------------------------------------------------------------
+
+class StylExLoss(StyleGAN2Loss):
+    """
+    Stylex paper: https://arxiv.org/pdf/2104.13369
+    """
+    def __init__(self, device, G, D, E, C,
+                 lambda_l1=1.0, lambda_lpips=0.1, lambda_w_rec=0.1, lambda_cls=0.1,
+                 **stylegan2_loss_kwargs):
+        super().__init__(device, G=G, D=D, **stylegan2_loss_kwargs)
+        # Encoder and Classifier for stylex
+        self.E = E
+        self.C = C
+
+        # weights for different losses
+        self.lambda_l1 = lambda_l1
+        self.lambda_lpips = lambda_lpips
+        self.lambda_w_rec = lambda_w_rec
+        self.lambda_cls = lambda_cls
+
+        self.l1_loss = torch.nn.L1Loss()
+        self.lpips_loss = lpips.LPIPS(net='alex').to(device).eval().requires_grad_(False)
+        self.kl_loss = torch.nn.KLDivLoss(reduction='batchmean', log_target=True)
+
+        # TODO: resnet50 pretrained from wbcatt expect imagenet type normalization
+        self.classfier_normalize_transform = torchvision.transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg, batch_idx):
+        # If phase is for discriminator, do nothing new
+        # Same thing for G regularization loss
+        if phase in ['Dmain', 'Dreg', 'Dboth']:
+            super().accumulate_gradients(phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg)
+            return
+        total_G_loss = torch.tensor(0.0, device=self.device)
+        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
+        is_noise_step = batch_idx % 2 == 0
+        #  if phase is for generator, perform new logic for G and E
+        G_E_loss = None
+        if phase in ['Gmain', 'Gboth']:
+            # Path A: Standard GAN training from random noise (z -> G -> img)
+            if is_noise_step:
+                with torch.autograd.profiler.record_function('Gmain_from_noise_forward'):
+                    gen_img, _gen_ws = self.run_G(gen_z, gen_c)
+                    gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+                    training_stats.report('Loss/scores/fake', gen_logits)
+                    training_stats.report('Loss/signs/fake', gen_logits.sign())
+                    loss_Gmain_adv = torch.nn.functional.softplus(-gen_logits)
+                    training_stats.report('Loss/G/loss', loss_Gmain_adv)
+                with torch.autograd.profiler.record_function('Gmain_from_noise_backward'):
+                    loss_Gmain_adv.mean().mul(gain).backward()
+            # Path B: StylEx Reconstruction training (x -> E -> G -> x_rec)
+            else:
+                with torch.autograd.profiler.record_function('G_E_reconstruction_forward'):
+                    #  The StylEx pipeline: real_img -> E -> w -> G -> x_rec
+                    # x_rec = G[E(x), C(x)]
+                    real_encoded = self.E(real_img, real_c) # other names: real encoded | or E(x) | or w_plus
+                    x_rec = self.G.synthesis(real_encoded, update_emas=True) # other names: G(real_encoded) | x' | fake image | fake output
+                    # ------ ADVERSARIAL LOSS ------ L_adv
+                    #  L_adv = -log(D(x_rec, C(x))) = G_loss_fn(fake_output, real_output)
+                    rec_logits = self.run_D(x_rec, real_c, blur_sigma=0)
+                    loss_G_adv = torch.nn.functional.softplus(-rec_logits)
+                    training_stats.report('Loss/G/adv_stylex', loss_G_adv)
+                    # ------ RECONSTRUCTION LOSS ------ L_rec
+                    #  L_rec = L^x_rec + L_lpips + L^w_rec
+                    loss_rec_lpips = self.lpips_loss(x_rec, real_img).mean() * self.lambda_lpips
+                    training_stats.report('Loss/G/rec_lpips', loss_rec_lpips)
+                    # L^x_rec reconstruction loss -- aka pixelwise similarity
+                    loss_rec_x = self.l1_loss(x_rec, real_img) * self.lambda_l1 # lambda_l1 = 0.1
+                    training_stats.report('Loss/G/rec_l1', loss_rec_x)
+                    # L^w_rec reconstruction loss -- aka w-space reconstruction loss
+                    w_rec = self.E(x_rec, real_c) # aka fake encoded E(x') | or E(x_rec)
+                    loss_rec_w = self.l1_loss(w_rec, real_encoded.detach()) * self.lambda_w_rec
+                    #  L_cls = D_KL(C(x_rec), C(x))
+                    real_img_normalized = self.classfier_normalize_transform(real_img)
+                    x_rec_normalized = self.classfier_normalize_transform(x_rec.clamp(-1, 1))
+                    real_clf_logits = self.C(real_img_normalized)
+                    rec_clf_logits = self.C(x_rec_normalized)
+                    # loss_cls = (loss_cls / len(real_clf_logits)) * self.lambda_cls
+                    #  For multi-class classification of 1 of 5 cell types, theres only one head
+                    log_p_real = F.log_softmax(real_clf_logits.detach(), dim=1)
+                    log_p_rec = F.log_softmax(rec_clf_logits, dim=1)
+                    loss_cls = self.kl_loss(log_p_rec, log_p_real) * self.lambda_cls
+                    training_stats.report('Loss/G/cls_kldiv', loss_cls)
+                    # ------ Sum loss for L_adv, L_rec, L_cls ------
+                    G_E_loss = loss_G_adv + loss_rec_x + loss_rec_lpips + loss_rec_w + loss_cls
+                    training_stats.report('Loss/G/total_stylex', G_E_loss)
+                    total_G_loss += G_E_loss.mean()
+                with torch.autograd.profiler.record_function('G_E_reconstruction_backward'):
+                    G_E_loss.mean().mul(gain).backward()
+
+            # ------- Gpl: Path length regularization for G -------
+            loss_Gpl = None
+            if phase in ['Greg', 'Gboth']:
+                if (cur_nimg // real_img.shape[0]) % 2 == 0:
+                    with torch.autograd.profiler.record_function('Gpl_forward'):
+                        batch_size = gen_z.shape[0] // self.pl_batch_shrink
+                        gen_img, gen_ws = self.run_G(gen_z[:batch_size], gen_c[:batch_size])
+                        pl_noise = torch.randn_like(gen_img) / np.sqrt(gen_img.shape[2] * gen_img.shape[3])
+                        with torch.autograd.profiler.record_function('pl_grads'), conv2d_gradfix.no_weight_gradients(self.pl_no_weight_grad):
+                            pl_grads = torch.autograd.grad(outputs=[(gen_img * pl_noise).sum()], inputs=[gen_ws], create_graph=True, only_inputs=True)[0]
+                        pl_lengths = pl_grads.square().sum(2).mean(1).sqrt()
+                        pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
+                        self.pl_mean.copy_(pl_mean.detach())
+                        pl_penalty = (pl_lengths - pl_mean).square()
+                        training_stats.report('Loss/pl_penalty', pl_penalty)
+                        loss_Gpl = pl_penalty * self.pl_weight
+                        training_stats.report('Loss/G/reg', loss_Gpl)
+                        total_G_loss += loss_Gpl.mean()
+                    with torch.autograd.profiler.record_function('Gpl_backward'):
+                        loss_Gpl.mean().mul(gain).backward()
+
+            # if total_G_loss != 0:
+                # with torch.autograd.profiler.record_function('G_E_backward'):
+                    # total_G_loss.mul(gain).backward()
+
+
+
+
+
+

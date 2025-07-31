@@ -20,6 +20,8 @@ build/
 # ===== our custom entries: =====
 # ignore wbcatt folder (I have wbcatt folder inside my repo root)
 wbcatt
+artifacts/
+attfind/
 
 # ignore any files/folders starts with 'temp'
 temp*

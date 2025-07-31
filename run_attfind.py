@@ -7,7 +7,9 @@ import os
 import click
 import h5py
 import numpy as np
+import PIL
 import torch
+import torchvision
 from tqdm import tqdm
 
 import dnnlib
@@ -64,6 +66,20 @@ class StyleCoordinator:
             h.remove()
         self.hooks = []
 
+def tensor_to_pil(tensor):
+    """Converts a torch tensor in the range [-1, 1] to a PIL image."""
+    tensor = (tensor.squeeze(0).permute(1, 2, 0) * 127.5 + 127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    return PIL.Image.fromarray(tensor, 'RGB')
+
+def normalize_for_resnet(tensor):
+    """Normalizes a tensor in the range [-1, 1] for a ResNet model."""
+    tensor = (tensor + 1) / 2
+    normalize_transform = torchvision.transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+    return normalize_transform(tensor)
+
 # ======================================================================================
 # === MAIN
 # ======================================================================================
@@ -76,6 +92,7 @@ class StyleCoordinator:
 @click.option('--num-images', help='Number of images to process from the dataset', type=int, default=250)
 @click.option('--shift-size', help='Magnitude of the style vector shift for perturbation', type=float, default=1.0)
 @click.option('--num-classes', help='Number of classes for the classifier', type=int, default=5, show_default=True)
+@click.option('--images-per-class', help='Number of quality images to collect for each class', type=int, default=1)
 @click.option('--d-threshold', help='Threshold for the discriminator to filter images', type=float, default=-0.5, show_default=True)
 def run_extraction(
     network_pkl: str,
@@ -85,20 +102,21 @@ def run_extraction(
     num_images: int,
     shift_size: float,
     num_classes: int,
-    d_threshold: float = -0.5
+    d_threshold: float = -0.5,
+    images_per_class: int = 1
 ):
     device = torch.device('cuda' if torch.cuda.is_available()
                           else "mps" if torch.mps.is_available()
                           else 'cpu')
     print(f"Using device: {device}")
-    outdir_desc = f"attfind-num{num_images}-shift{shift_size}-dth{d_threshold}"
+    outdir_desc = f"{os.path.basename(network_pkl)}-num{num_images}-shift{shift_size}-dth{d_threshold}"
     outdir = os.path.join(outdir, outdir_desc)
     os.makedirs(outdir, exist_ok=True)
 
     print(f'Loading network checkpoint "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl) as f:
         checkpoint = torch.load(f, map_location=device, weights_only=False)
-    dataset_args = dnnlib.EasyDict(path=data_path, use_labels=True, max_size=num_images)
+    dataset_args = dnnlib.EasyDict(path=data_path, use_labels=True, max_size=None)
     dataset=dataset_legacy.ImageFolderDataset(**dataset_args)
     model_params_from_dataset = {
         'c_dim': dataset.label_dim,
@@ -137,7 +155,7 @@ def run_extraction(
     E.load_state_dict(checkpoint['E'])
     C = load_resnet18_classifier(path=classifier_path, num_classes=num_classes, device=device).eval()
 
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=True)
 
     # Get style coordinates with hooks
     style_coordinator = StyleCoordinator(G)
@@ -146,34 +164,78 @@ def run_extraction(
     print(f"# of style coordinates: {num_style_coords}")
 
     print(f"{num_images}, {d_threshold}, {shift_size}, {num_classes}")
+    print(f"min images per class: {images_per_class}")
     filtered_w_plus = []
     filtered_style_coords = []
     filtered_real_imgs = []
     filtered_real_cs = []
     dataloader_iter = iter(dataloader)
+    sample_outdir = os.path.join(outdir, 'quality_check_samples')
+    os.makedirs(sample_outdir, exist_ok=True)
+    print(f"Saving quality check samples to: {sample_outdir}")
+    filtered_data_by_class = {i: [] for i in range(num_classes)}
+    from collections import Counter
+    pre_filter_class_counts = Counter()
+    post_filter_class_counts = Counter()
+    saved_pass_samples = 0
+    saved_fail_samples = 0
+    max_samples_to_save = 5
 
     with tqdm(total=num_images, desc="Get only quality image over d-threshold") as pbar:
         while len(filtered_w_plus) < num_images:
             try:
                 batch = next(dataloader_iter)
             except StopIteration as e:
-                print(f"{e}. image loader error")
-                return
+                print(f"{e}. image loader error Data exhausted")
+                break
             real_img, real_c = batch
             real_img_norm = (real_img.to(device).to(torch.float32) / 127.5 - 1)
+            original_class_idx = torch.argmax(real_c, dim=1).item()
             real_c = real_c.to(device)
+            clf_real_class_idx = torch.argmax(C(normalize_for_resnet(real_img_norm)), dim=1).item()
+            pre_filter_class_counts[original_class_idx] += 1
             with torch.no_grad():
                 w_plus = E(real_img_norm, real_c)
                 reconstructed_image = G.synthesis(w_plus)
                 d_score = D(reconstructed_image, real_c)
-                # Check if the discriminator score meets the threshold
-                if d_score.item() >= d_threshold:
-                    style_coords = style_coordinator.get_styles(w_plus)
-                    filtered_w_plus.append(w_plus.cpu())
-                    filtered_style_coords.append(style_coords.cpu())
-                    filtered_real_imgs.append(real_img.cpu())
-                    filtered_real_cs.append(real_c.cpu())
-                    pbar.update(1)
+                d_score_real = D(real_img_norm, real_c)
+
+                reconstructed_logits = C(normalize_for_resnet(reconstructed_image))
+                reconstructed_class_idx = torch.argmax(reconstructed_logits, dim=1).item()
+                # only take recon images below d_threshold and are classified in the right class as the original image
+                if d_score.item() <= d_threshold and reconstructed_class_idx == original_class_idx:
+                    min_met_for_all = all(post_filter_class_counts.get(i, 0) >= images_per_class for i in range(num_classes))
+                    # Decide whether to accept the image
+                    accept_image = False
+                    if not min_met_for_all:
+                        if post_filter_class_counts.get(original_class_idx, 0) < images_per_class:
+                            accept_image = True
+                    else:
+                        accept_image = True
+                    if accept_image:
+                        if saved_pass_samples < max_samples_to_save:
+                            comparison_img = torch.cat([real_img_norm, reconstructed_image], dim=3)
+                            pil_img = tensor_to_pil(comparison_img)
+                            filename = f"pass_sample_{saved_pass_samples}_class_{original_class_idx}_clfclass{clf_real_class_idx}_dscorereal_{d_score_real.item():.2f}_dscore_{d_score.item():.2f}.png"
+                            pil_img.save(os.path.join(sample_outdir, filename))
+                            saved_pass_samples += 1
+                        style_coords = style_coordinator.get_styles(w_plus)
+                        post_filter_class_counts[original_class_idx] += 1
+                        collected_data = (w_plus.cpu(), style_coords.cpu(), real_img.cpu(), real_c.cpu())
+                        filtered_data_by_class[original_class_idx].append(collected_data)
+                        filtered_w_plus.append(w_plus.cpu())
+                        filtered_style_coords.append(style_coords.cpu())
+                        filtered_real_imgs.append(real_img.cpu())
+                        filtered_real_cs.append(real_c.cpu())
+                        pbar.update(1)
+                else:
+                    # This image FAILS the filter
+                    if saved_fail_samples < max_samples_to_save:
+                        comparison_img = torch.cat([real_img_norm, reconstructed_image], dim=3)
+                        pil_img = tensor_to_pil(comparison_img)
+                        filename = f"fail_sample_{saved_fail_samples}_class_{original_class_idx}_clfclass{clf_real_class_idx}_recclass{reconstructed_class_idx}_dscorereal_{d_score_real.item():.2f}_dscore_{d_score.item():.2f}.png"
+                        pil_img.save(os.path.join(sample_outdir, filename))
+                        saved_fail_samples += 1
 
     style_coords_tensor = torch.cat(filtered_style_coords, dim=0)
     minima = torch.min(style_coords_tensor, dim=0).values.to(device)
@@ -186,6 +248,14 @@ def run_extraction(
         print(f"WARNING: Overwriting existing file at '{h5_path}'")
         os.remove(h5_path)
 
+    # --- Add final diagnostic report ---
+    print("\n" + "="*50)
+    print("Class Distribution Report")
+    print(f"{'Class':<10} | {'Before Filter':<15} | {'After Filter':<15}")
+    print("-"*50)
+    for i in range(num_classes):
+        print(f"{i:<10} | {pre_filter_class_counts[i]:<15} | {post_filter_class_counts[i]:<15}")
+    print("="*50 + "\n")
     with h5py.File(h5_path, 'w') as f:
         dset_sce = f.create_dataset('style_change', (num_images, 2, num_style_coords, num_classes), dtype='f')
         # w_dim + num_classes
@@ -204,8 +274,8 @@ def run_extraction(
             with torch.no_grad():
                 style_coords = style_coordinator.get_styles(w_plus)
                 generated_image = G.synthesis(w_plus)
-                base_logits = C(real_img_norm)
-                generated_logits = C(generated_image)
+                base_logits = C(normalize_for_resnet(real_img_norm))
+                generated_logits = C(normalize_for_resnet(generated_image))
                 concat_w_tensor = torch.cat([w_plus.mean(dim=1), base_logits], dim=1)
 
                 style_change_effect = torch.zeros(2, num_style_coords, num_classes, device=device)
@@ -222,7 +292,7 @@ def run_extraction(
                     for dir_idx, shift in enumerate([s_shift_down, s_shift_up]):
                         target_layer.bias.data += shift.squeeze(0)
                         perturbed_image = G.synthesis(w_plus)
-                        shift_logits = C(perturbed_image)
+                        shift_logits = C(normalize_for_resnet(perturbed_image))
                         target_layer.bias.data -= shift.squeeze(0)
                         style_change_effect[dir_idx, sindex, :] = (shift_logits - generated_logits).squeeze(0)
 
